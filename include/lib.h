@@ -46,7 +46,7 @@ struct arp_table_entry {
     uint8_t mac[6];
 };
 
-struct packet_cache {
+struct packet_info {
 	char *buf;
 	size_t len;
 	int interface;
