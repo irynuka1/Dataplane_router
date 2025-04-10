@@ -194,12 +194,10 @@ static int handle_icmp(int iface, char *buf, int len, uint8_t icmp_type)
     struct ip_hdr *ip = (struct ip_hdr *)(buf + sizeof(struct ether_hdr));
     struct icmp_hdr *icmp = (struct icmp_hdr *)(ip + 1);
 
-    //(*ip).checksum = 0;
     (*ip).checksum = htons(checksum((uint16_t *)ip, sizeof(struct ip_hdr)));
 
     (*icmp).mtype = icmp_type;
     (*icmp).mcode = 0;
-    //(*icmp).check = 0;
     (*icmp).check = htons(checksum((uint16_t *)icmp, sizeof(struct icmp_hdr)));
 
     if (icmp_type == ICMP_REPLY) {
@@ -209,8 +207,8 @@ static int handle_icmp(int iface, char *buf, int len, uint8_t icmp_type)
     } else {
         memcpy((icmp + 1), ip, 8);
 
-        (*ip).dest_addr = (*ip).source_addr;
         (*ip).source_addr = inet_addr(get_interface_ip(iface));
+        (*ip).dest_addr = (*ip).source_addr;
         (*ip).ttl = TTL;
         (*ip).proto = IPPROTO_ICMP;
 
