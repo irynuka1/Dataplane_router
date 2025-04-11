@@ -13,6 +13,7 @@
 #define TIMEOUT 11
 #define NO_HOST 3
 #define ICMP_REPLY 0
+#define METADATA_SIZE (sizeof(size_t) + sizeof(int) + sizeof(uint32_t))
 
 struct route_table_entry *routing_entries;
 struct arp_table_entry *arp_entries;
@@ -29,7 +30,7 @@ static void reduce_ttl(struct ip_hdr *hdr)
     int prev_ttl = (*hdr).ttl;
     uint16_t prev_checksum = (*hdr).checksum;
     (*hdr).ttl--;
-    (*hdr).checksum = ~(~prev_checksum + ~((uint16_t)prev_ttl) + ((uint16_t)(*hdr).ttl)) - 1;
+    (*hdr).checksum = ~(~prev_checksum + ~((uint16_t)prev_ttl) + ((uint16_t)((*hdr).ttl))) - 1;
 }
 
 // Setting the boradcast MAC address to 0xFF:FF:FF:FF:FF:FF
@@ -39,60 +40,61 @@ static void set_broadcast_mac(uint8_t *mac)
         mac[i] = 0xFF;
 }
 
-// Searching the best route that matches the destination IP
-struct route_table_entry *route_lookup(uint32_t dest_ip)
+// Searching the best route that matches the destination IP using binary search
+struct route_table_entry *route_lookup(uint32_t ip)
 {
     struct route_table_entry *route = NULL;
+    int left = 0;
+    int right = routing_count - 1;
 
-    for (int i = 0; i < routing_count; i++)
-        if ((dest_ip & routing_entries[i].mask) == routing_entries[i].prefix)
-            if (!route || (ntohl(routing_entries[i].mask) > ntohl((*route).mask)))
-                route = &routing_entries[i];
+    while (left <= right) {
+        int mid = (left + right) / 2;
+
+        if ((ip & routing_entries[mid].mask) == routing_entries[mid].prefix)
+            if (!route || (ntohl(routing_entries[mid].mask) > ntohl((*route).mask)))
+                route = &routing_entries[mid];
+
+        if (ntohl(ip) >= ntohl(routing_entries[mid].prefix))
+            right = mid - 1;
+        else
+            left = mid + 1;
+    }
 
     return route;
 }
 
-// Sorting the routing table entries first by prefix and then by mask
-static void sort_routing_entries(struct route_table_entry *table, int count)
+// Comparator for qsort
+static int cmp_routing_entries(const void *a, const void *b)
 {
-    int i, j;
-    for (i = 1; i < count; i++) {
-        struct route_table_entry key = table[i];
-        j = i - 1;
+    const struct route_table_entry *rt1 = (const struct route_table_entry *)a;
+    const struct route_table_entry *rt2 = (const struct route_table_entry *)b;
+    uint32_t prefix1 = ntohl((*rt1).prefix);
+    uint32_t prefix2 = ntohl((*rt2).prefix);
 
-        while (j >= 0) {
-            int cmp;
+    if (prefix1 != prefix2)
+        return (prefix1 > prefix2) ? -1 : 1;
 
-            if (ntohl(table[j].prefix) != ntohl(key.prefix))
-                cmp = (ntohl(table[j].prefix) > ntohl(key.prefix)) ? -1 : 1;
-            else
-                cmp = (ntohl(table[j].mask) > ntohl(key.mask)) ? -1 : 1;
+    uint32_t mask1 = ntohl((*rt1).mask);
+    uint32_t mask2 = ntohl((*rt2).mask);
 
-            if (cmp > 0) {
-                table[j + 1] = table[j];
-                j--;
-            } else {
-                break;
-            }
-        }
+    if (mask1 != mask2)
+        return (mask1 > mask2) ? -1 : 1;
 
-        table[j + 1] = key;
-    }
+    return 0;
 }
 
 // Setting packet details and enqueuing it
 static void enq_packet(struct route_table_entry *route, char *buf, int len)
 {
-    struct packet_info *packet = malloc(sizeof(struct packet_info));
+    char *block = malloc(METADATA_SIZE + len);
 
-    (*packet).len = len;
-    (*packet).interface = (*route).interface;
-    (*packet).next_hop = (*route).next_hop;
-    (*packet).buf = malloc(len);
+    *(size_t *)block = len;
+    *(int *)(block + sizeof(size_t)) = (*route).interface;
+    *(uint32_t *)(block + sizeof(size_t) + sizeof(int)) = (*route).next_hop;
 
-    memcpy((*packet).buf, buf, len);
+    memcpy(block + METADATA_SIZE, buf, len);
 
-    queue_enq(packet_queue, packet);
+    queue_enq(packet_queue, block);
     queued_packet_count++;
 }
 
@@ -118,6 +120,7 @@ static void arp_req_handler(int iface, char *buf, int len)
     send_to_link(len, buf, iface);
 }
 
+
 // Handling ARP replies by updating the ARP table and sending queued packets if possible
 static void arp_rep_handler(int iface, char *buf, int len)
 {
@@ -132,16 +135,20 @@ static void arp_rep_handler(int iface, char *buf, int len)
     queued_packet_count = 0;
 
     for (int i = 0; i < previous_queue_size; i++) {
-        struct packet_info *packet = (struct packet_info *)queue_deq(packet_queue);
-        struct ether_hdr *packet_eth = (struct ether_hdr *)(*packet).buf;
+        char *block = (char *)queue_deq(packet_queue);
+        size_t pkt_len = *(size_t *)block;
+        int stored_iface = *(int *)(block + sizeof(size_t));
+        uint32_t stored_next_hop = *(uint32_t *)(block + sizeof(size_t) + sizeof(int));
+        char *packet_buf = block + METADATA_SIZE;
+        struct ether_hdr *packet_eth = (struct ether_hdr *)packet_buf;
 
-        if (ntohl((*packet).next_hop) == ntohl((*arp).sprotoa)) {
+        if (ntohl(stored_next_hop) == ntohl((*arp).sprotoa)) {
             memcpy((*packet_eth).ethr_dhost, (*arp).shwa, MAC_LEN);
             memcpy((*packet_eth).ethr_shost, (*arp).thwa, MAC_LEN);
-            send_to_link((*packet).len, (*packet).buf, (*packet).interface);
-            free(packet);
+            send_to_link(pkt_len, packet_buf, stored_iface);
+            free(block);
         } else {
-            queue_enq(packet_queue, packet);
+            queue_enq(packet_queue, block);
             queued_packet_count++;
         }
     }
@@ -185,7 +192,6 @@ static int enqueue_arp(int iface, struct route_table_entry *route, char *buf, in
     return create_arp_req(route, buf, len);
 }
 
-
 /*      ICMP HANDLER        */
 
 // Creating an ICMP message based on the type
@@ -218,7 +224,6 @@ static int handle_icmp(int iface, char *buf, int len, uint8_t icmp_type)
 
     return len;
 }
-
 
 /*      IP PACKET HANDLER       */
 
@@ -306,8 +311,7 @@ int main(int argc, char *argv[])
     arp_entries = malloc(100 * sizeof(struct arp_table_entry));
 
     routing_count = read_rtable(argv[1], routing_entries);
-
-    sort_routing_entries(routing_entries, routing_count);
+    qsort(routing_entries, routing_count, sizeof(struct route_table_entry), cmp_routing_entries);
 
     packet_queue = create_queue();
     queued_packet_count = 0;
