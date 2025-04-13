@@ -1,6 +1,6 @@
 #!/bin/bash
 
-if [ ! -f README ]; then
+if [ ! -f README.md ]; then
     echo "No README present! Exiting..." >&2
     exit 1
 fi

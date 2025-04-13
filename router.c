@@ -13,7 +13,7 @@
 #define TIMEOUT 11
 #define NO_HOST 3
 #define ICMP_REPLY 0
-#define METADATA_SIZE (sizeof(size_t) + sizeof(int) + sizeof(uint32_t))
+#define METADATA (sizeof(size_t) + sizeof(int) + sizeof(uint32_t))
 
 struct route_table_entry *routing_entries;
 struct arp_table_entry *arp_entries;
@@ -40,6 +40,26 @@ static void set_broadcast_mac(uint8_t *mac)
         mac[i] = 0xFF;
 }
 
+// Comparator for qsort
+static int cmp_routing_entries(const void *a, const void *b)
+{
+    const struct route_table_entry *rt1 = (const struct route_table_entry *)a;
+    const struct route_table_entry *rt2 = (const struct route_table_entry *)b;
+    uint32_t prefix1 = ntohl((*rt1).prefix);
+    uint32_t prefix2 = ntohl((*rt2).prefix);
+
+    if (prefix1 != prefix2)
+        return (prefix1 > prefix2) ? -1 : 1;
+
+    uint32_t mask1 = ntohl((*rt1).mask);
+    uint32_t mask2 = ntohl((*rt2).mask);
+
+    if (mask1 != mask2)
+        return (mask1 > mask2) ? -1 : 1;
+
+    return 0;
+}
+
 // Searching the best route that matches the destination IP using binary search
 struct route_table_entry *route_lookup(uint32_t ip)
 {
@@ -63,36 +83,16 @@ struct route_table_entry *route_lookup(uint32_t ip)
     return route;
 }
 
-// Comparator for qsort
-static int cmp_routing_entries(const void *a, const void *b)
-{
-    const struct route_table_entry *rt1 = (const struct route_table_entry *)a;
-    const struct route_table_entry *rt2 = (const struct route_table_entry *)b;
-    uint32_t prefix1 = ntohl((*rt1).prefix);
-    uint32_t prefix2 = ntohl((*rt2).prefix);
-
-    if (prefix1 != prefix2)
-        return (prefix1 > prefix2) ? -1 : 1;
-
-    uint32_t mask1 = ntohl((*rt1).mask);
-    uint32_t mask2 = ntohl((*rt2).mask);
-
-    if (mask1 != mask2)
-        return (mask1 > mask2) ? -1 : 1;
-
-    return 0;
-}
-
 // Setting packet details and enqueuing it
 static void enq_packet(struct route_table_entry *route, char *buf, int len)
 {
-    char *block = malloc(METADATA_SIZE + len);
+    char *block = malloc(METADATA + len);
 
     *(size_t *)block = len;
     *(int *)(block + sizeof(size_t)) = (*route).interface;
     *(uint32_t *)(block + sizeof(size_t) + sizeof(int)) = (*route).next_hop;
 
-    memcpy(block + METADATA_SIZE, buf, len);
+    memcpy(block + METADATA, buf, len);
 
     queue_enq(packet_queue, block);
     queued_packet_count++;
@@ -139,7 +139,7 @@ static void arp_rep_handler(int iface, char *buf, int len)
         size_t pkt_len = *(size_t *)block;
         int stored_iface = *(int *)(block + sizeof(size_t));
         uint32_t stored_next_hop = *(uint32_t *)(block + sizeof(size_t) + sizeof(int));
-        char *packet_buf = block + METADATA_SIZE;
+        char *packet_buf = block + METADATA;
         struct ether_hdr *packet_eth = (struct ether_hdr *)packet_buf;
 
         if (ntohl(stored_next_hop) == ntohl((*arp).sprotoa)) {
@@ -154,7 +154,7 @@ static void arp_rep_handler(int iface, char *buf, int len)
     }
 }
 
-// Creating an ARP request packet
+// Creating an ARP request
 static int create_arp_req(struct route_table_entry *route, char *buf, int len)
 {
     struct arp_hdr *arp = (struct arp_hdr *)(buf + sizeof(struct ether_hdr));
