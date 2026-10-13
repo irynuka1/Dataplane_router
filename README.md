@@ -1,80 +1,86 @@
-Coitu Sebastian-Teodor 324CA
+# Dataplane Router
 
-# README – Dataplane Router
+A software router dataplane written in C. It receives raw Ethernet frames, forwards IPv4 packets using longest-prefix match, resolves next-hop MAC addresses with ARP, and generates ICMP replies and errors.
 
-În acest proiect se implementează dataplane-ul unui router, abordând principalele mecanisme de forwarding IPv4, ARP și generare de mesaje ICMP descrise în cadrul laboratoarelor de PCom. Implementarea se bazează pe un set de API-uri furnizate (ex.: `recv_from_any_link`, `send_to_link`, `read_rtable`, etc.) și pe manipularea directă a cadrelor Ethernet, pachetelor IP, mesajelor ARP și ICMP.
+Built as a university networking assignment (Communication Protocols, UPB) on top of a provided link-layer API (`lib/`) and a Mininet-based checker.
 
----
+## Features
 
-## Prezentare generală
+| Area | Behaviour |
+|------|-----------|
+| **IPv4 forwarding** | Validates the header checksum, drops expired packets, decrements TTL and incrementally updates the checksum (RFC 1624). |
+| **Routing (LPM)** | Static routing table loaded at startup, sorted once with `qsort`, then searched with binary search. |
+| **ARP** | Answers ARP requests, sends requests for unknown next hops, and caches replies in a dynamic ARP table. |
+| **Packet queue** | Packets waiting for ARP resolution are queued and flushed when the matching reply arrives. |
+| **ICMP** | Echo Reply for packets addressed to the router, Time Exceeded (type 11) on TTL expiry, Destination Unreachable (type 3) when no route exists. |
 
-Proiectul îndeplinește următoarele cerințe:
+## Project layout
 
-- **Forwarding IPv4:** Recepționarea cadrelor Ethernet, parsarea header-elor IP, verificarea integrității (checksum) și a valorii TTL, precum și decrementarea acestuia înainte de trimiterea pachetului pe interfața de ieșire.
-- **Longest Prefix Match (LPM):** Găsirea celei mai potrivite intrări în tabela de rutare folosind binary search pe un vector de intrări sortat descrescător după prefix și mască.
-- **Protocolul ARP:** Găsirea adresei MAC a următorului hop prin trimiterea ARP request-urilor și procesarea ARP reply-urilor, cu menținerea unui cache local. Pachetele ce nu pot fi trimise imediat sunt puse într-o coadă.
-- **Protocolul ICMP:** Generarea mesajelor de răspuns (Echo Reply pentru pachetele destinate routerului) și a mesajelor de eroare (Time Exceeded pentru pachete cu TTL expirat sau Destination Unreachable pentru lipsa unei rute).
+```
+.
+├── router.c          # Router logic: forwarding, ARP, ICMP
+├── include/
+│   ├── protocols.h   # Ethernet, IP, ARP and ICMP header structs
+│   ├── lib.h         # Link-layer API (recv/send, route table reader, checksum)
+│   ├── queue.h       # Queue interface
+│   └── list.h        # Linked list interface
+├── lib/              # Provided support code (lib.c, queue.c, list.c)
+├── checker/          # Mininet topology and automated tests
+├── rtable0.txt       # Routing table for router 0
+├── rtable1.txt       # Routing table for router 1
+├── Makefile
+└── create_archive.sh # Packs the submission archive
+```
 
----
+## How it works
 
-## Structuri de date utilizate
+```
+recv_from_any_link
+        │
+   handle_packet ── EtherType ──┬─ 0x0800 (IPv4) → route_ip_packet
+                                └─ 0x0806 (ARP)  → arp_req_handler / arp_rep_handler
+```
 
-- **Structurile:** **`ether_hdr`**, **`ip_hdr`**, **`arp_hdr`**, **`icmp_hdr`**, care au fost deja implementate în scheletul temei.
+**IPv4 path (`route_ip_packet`)**
 
-- **Tabele:**
-  - **Tabela de rutare (`routing_entries`):** Reprezentată printr-un vector de structuri `route_table_entry` alocat dinamic cu dimensiunea standard de 100k elemente.
-  - **Tabela ARP (`arp_entries`):** Gestionată dinamic într-un vector de structuri `arp_table_entry`.
+1. If the packet is addressed to the router, answer with an ICMP Echo Reply.
+2. Verify the IP checksum; drop the packet if it is corrupt.
+3. If `TTL <= 1`, send ICMP *Time Exceeded*.
+4. Look up the best route (`route_lookup`); if none exists, send ICMP *Destination Unreachable*.
+5. Decrement TTL (`reduce_ttl`) and look up the next hop in the ARP table.
+6. On a hit, rewrite the Ethernet addresses and forward. On a miss, queue the packet and broadcast an ARP request.
 
-- **Coadă de pachete:**  
-  Pachetele care așteaptă ARP-ul sunt plasate într-o coadă `packet_queue` (folosind funcționalitatea din `queue.h`). Se stochează metadate suplimentare în `METADATA` (dimensiunea pachetului, interfața de ieșire și adresa IP a următorului hop) pentru a reconstitui cadrul la trimitere.
+**ARP path**
 
----
+- *Request:* turn the received frame into a reply carrying the interface MAC.
+- *Reply:* store the IP→MAC mapping, then walk the queue and send every packet whose next hop matches; the rest stay queued.
 
-## Procesarea pachetelor
+### Key data structures
 
-1. **Recepția cadrelor:**
-   - Bucla din `main()` apelează funcția `recv_from_any_link` pentru a primi cadre Ethernet de pe oricare interfață.
+- **`routing_entries`** – array of `route_table_entry` (up to 100k), sorted by prefix and mask in descending order.
+- **`arp_entries`** – array of `arp_table_entry` holding learned IP→MAC mappings.
+- **`packet_queue`** – queue of heap blocks, each laid out as `[length | out interface | next hop | frame bytes]` (see `METADATA`).
 
-2. **Determinarea tipului de pachet:**
-   - Funcția `handle_packet` inspectează câmpul `ethr_type` din header-ul Ethernet:
-     - Pentru cadre IPv4 (`0x0800`), se apelează `route_ip_packet`.
-     - Pentru cadre ARP (`0x0806`), se procesează cu `arp_req_handler` sau `arp_rep_handler` în funcție de opcode.
+## Build and run
 
-3. **IP forwarding – făcut aproape complet în laboratorul 4:**
-   - Se verifică dacă pachetul IP este destinat direct routerului sau dacă trebuie trimis mai departe.
-   - Se validează integritatea pachetului prin calculul checksum-ului și se decrementează TTL-ul. Dacă acesta este prea mic, se generează un mesaj ICMP "Time Exceeded".
-   - Se caută intrarea corespunzătoare în tabela de rutare folosind funcția `route_lookup` (Longest Prefix Match).
+```bash
+make                                    # build ./router
+./router <rtable> <iface0> <iface1> ... # e.g. ./router rtable0.txt rr-0-1 r-0 r-1
+make clean
+```
 
-4. **ARP:**
-   - Dacă nu există o intrare ARP pentru următorul hop, pachetul este pus în coadă (`enqueue_arp`) și se generează un ARP Request (`create_arp_req`).
-   - La primirea unui ARP Reply (`arp_rep_handler`), tabela ARP este actualizată și pachetele din coadă, aflate în așteptarea unei rezoluții ARP, sunt retransmise.
+Shortcuts: `make run_router0` and `make run_router1`.
 
-5. **Generarea mesajelor ICMP (`handle_icmp`):**
-   - Pentru pachetele destinate routerului, se generează mesaje de tip Echo Reply.
-   - Pentru erori (TTL expirat sau lipsa unui next hop), se generează mesaje ICMP de tip "Time Exceeded" sau "Destination Unreachable".
+Routing table format (one route per line): `prefix next_hop mask interface`
 
----
+```
+192.127.86.0 192.127.86.2 255.255.255.0 0
+```
 
-## Detalii de implementare
+## Testing
 
-### Gestionarea TTL și Checksum
+The checker builds a Mininet topology with two routers and several hosts, then runs forwarding, ARP, ICMP and LPM tests. It needs Mininet and root privileges:
 
-- **`reduce_ttl`:**  
-  Decrementează valoarea TTL din header-ul IP și actualizează checksum-ul, ținând cont de schimbarea efectuată.
-
-- **`set_broadcast_mac`:**  
-  Setează un vector de 6 octeți la valoarea `0xFF`, reprezentând adresa MAC de destinație ca fiind broadcast.
-
-### Căutarea în tabela de rutare (Longest Prefix Match)
-
-- **`cmp_routing_entries`:**  
-  Funcția folosită de `qsort` pentru sortarea intrărilor din tabela de rutare. Se ordonează descrescător după valoarea prefixului și a măștii (după conversia în host order), pentru a facilita căutările.
-
-- **`route_lookup`:**  
-  Utilizează o căutare binară pe vectorul sortat pentru a găsi intrarea cu cea mai specifică mască care se potrivește cu adresa de destinație din pachet.
-
----
-
-## Concluzie
-
-Această temă a constituit o completare a laboratoarelor, contribuind la aprofundarea cunoștințelor despre rețele la nivel practic. Prin implementarea codului, am reușit să înțeleg fiecare detaliu esențial al funcționării rețelelor, la nivelul predat până în acest moment. Am structurat codul într-un mod modular și am adăugat comentarii sugestive, pentru o înțelegere cât mai clară și intuitivă a implementării. În plus, enunțul temei a fost foarte descriptiv, iar materialele explicative oferite au fost de mare ajutor.
+```bash
+./checker/checker.sh
+```
